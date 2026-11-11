@@ -18,6 +18,17 @@ Because of that, follow these installation instructions:
 The filter can be found in the filters window under "Effect Filters".
 It can be used on any type of source, not just Video Capture Devices!
 
+## Settings
+
+- **Quality**: which Vision model to use. Balanced keeps up with 30 fps video on Apple Silicon; Accurate produces a larger mask but takes longer than one frame, so some frames get a mask blended from their neighbours.
+- **Threshold** / **Edge softness**: where the cut is made and how wide the transition is.
+- **Edge refinement**: joint bilateral upsampling of the mask, which pulls the mask edge onto real edges in the picture.
+- **Temporal smoothing**: steadies edge flicker between frames without making moving edges trail.
+- **Defringe**: replaces leftover background colour on the edge with colour from just inside the subject.
+- **Automatic mask sync** / **Mask sync delay**: segmentation runs on another thread and finishes a frame or more after the frame it was started for. The filter holds the video back by that many frames so that every frame is shown with its own mask, which removes the halo that otherwise trails a moving subject. Automatic picks the smallest delay that works; add the same delay to your audio if lip sync matters.
+
+The OBS log reports the mask size, segmentation time and how late masks arrive every 600 masks.
+
 ## License and Thanks
 This plugin is licensed under the terms of the General Public License, Version 2. You can find the full text in the `LICENSE` file in this repository.
 
