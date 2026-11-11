@@ -28,6 +28,11 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
+/* Can be overridden at build time to install a build next to another version of the plugin. */
+#ifndef VISION_FILTER_ID
+#define VISION_FILTER_ID "mac_vision_filter"
+#endif
+
 #define MAX_SYNC_DELAY 4
 #define FRAME_RING (MAX_SYNC_DELAY + 1)
 #define MASK_RING 4
@@ -698,7 +703,7 @@ static void vision_destroy(void *filter_ptr)
 bool obs_module_load(void)
 {
     struct obs_source_info info = {
-        .id = "mac_vision_filter",
+        .id = VISION_FILTER_ID,
         .type = OBS_SOURCE_TYPE_FILTER,
         .output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_SRGB,
         .get_name = vision_get_name,
