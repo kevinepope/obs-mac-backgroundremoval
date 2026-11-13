@@ -1,22 +1,32 @@
 uniform float4x4 ViewProj;
-uniform texture2d image;
 
+/* The frame being shown (Draw) */
+uniform texture2d image;
+uniform float2 image_texel;
+/* 1.0 when `image` is sampled as linear light, 0.0 when it is sampled as stored */
+uniform float image_linear;
+
+/* The new mask (Stabilize) or the stabilised mask (Guide), and the previous stabilised mask */
 uniform texture2d mask;
 uniform texture2d mask_prev;
-/* Mask of a later frame and how far to blend towards it, for frames without a mask of their own */
-uniform texture2d mask_next;
-uniform float mask_mix;
+uniform float2 mask_texel;
 
-/* Spacing of the refinement taps, in UV units */
-uniform float2 tap_step;
-/* Size of one image pixel, in UV units */
-uniform float2 image_texel;
+/* Small copies of the frame the mask belongs to and of the frame the previous mask belonged to */
+uniform texture2d guide;
+uniform texture2d guide_prev;
 
+/* Guided filter coefficients for the shown frame, and for a later frame to blend towards when the
+ * shown frame has no mask of its own */
+uniform texture2d coeff;
+uniform texture2d coeff_next;
+uniform float coeff_mix;
+
+uniform float blur_radius;
+uniform float smoothing;
+uniform float guide_eps;
 uniform float edge_lo;
 uniform float edge_hi;
-uniform float range_scale;
 uniform float defringe_px;
-uniform float smoothing;
 
 sampler_state texSampler {
 	Filter    = Linear;
@@ -41,62 +51,137 @@ VertData VSDefault(VertData v_in)
 	return v_out;
 }
 
-/* Temporal stabilisation, run once per new mask at mask resolution.
- * Small frame-to-frame changes (flicker) are blended with the previous mask,
- * large changes (real motion) pass through untouched so nothing trails. */
+float luma(float3 color)
+{
+	return dot(color, float3(0.299, 0.587, 0.114));
+}
+
+float3 to_nonlinear(float3 color)
+{
+	float3 low = color * 12.92;
+	float3 high = 1.055 * pow(max(color, float3(0.0031308, 0.0031308, 0.0031308)), float3(0.41666, 0.41666, 0.41666)) - 0.055;
+	return lerp(low, high, step(float3(0.0031308, 0.0031308, 0.0031308), color));
+}
+
+/* How much the picture changed at this point between the two frames the masks belong to */
+float picture_change(float2 pos)
+{
+	return length(guide.Sample(texSampler, pos).rgb - guide_prev.Sample(texSampler, pos).rgb);
+}
+
+/* Pass 1, once per new mask at mask resolution: spatial and temporal stabilisation.
+ * The mask is blurred slightly, which rounds off the blocky outline of the low resolution mask.
+ * It is then blended with the previous mask wherever the picture itself did not change: if the
+ * pixels are the same as last time, the mask should be too, and any difference is the model
+ * flickering. Where the picture did change the new mask is used as is, so nothing trails. */
 float4 PSStabilize(FragData f_in) : TARGET
 {
-	float cur = mask.Sample(texSampler, f_in.uv).r;
-	float prev = mask_prev.Sample(texSampler, f_in.uv).r;
-	float still = 1.0 - smoothstep(0.03, 0.25, abs(cur - prev));
-	float value = lerp(cur, prev, smoothing * still);
+	float2 uv = f_in.uv;
+	float2 blur = mask_texel * blur_radius;
+	float cur = mask.Sample(texSampler, uv).r * 0.4;
+	cur += mask.Sample(texSampler, uv + blur).r * 0.15;
+	cur += mask.Sample(texSampler, uv - blur).r * 0.15;
+	cur += mask.Sample(texSampler, uv + float2(blur.x, -blur.y)).r * 0.15;
+	cur += mask.Sample(texSampler, uv + float2(-blur.x, blur.y)).r * 0.15;
+
+	float2 dx = float2(mask_texel.x * 1.5, 0.0);
+	float2 dy = float2(0.0, mask_texel.y * 1.5);
+	float change = picture_change(uv) * 0.5;
+	change += picture_change(uv + dx) * 0.125;
+	change += picture_change(uv - dx) * 0.125;
+	change += picture_change(uv + dy) * 0.125;
+	change += picture_change(uv - dy) * 0.125;
+	float still = 1.0 - smoothstep(0.04, 0.12, change);
+
+	/* A change too small to be a real movement of the outline is held back completely, which
+	 * stops low level shimmer; larger changes are eased in. */
+	float prev = mask_prev.Sample(texSampler, uv).r;
+	float quiet = 1.0 - smoothstep(0.04, 0.12, abs(cur - prev));
+	float hold = lerp(smoothing, step(0.001, smoothing), quiet);
+	float value = lerp(cur, prev, hold * still);
 	return float4(value, value, value, 1.0);
 }
 
-float mask_at(float2 pos)
+/* Brightness, mask and their products at one point, for the guided filter statistics */
+float4 guide_stats(float2 pos)
 {
-	return lerp(mask.Sample(texSampler, pos).r, mask_next.Sample(texSampler, pos).r, mask_mix);
+	float brightness = luma(guide.Sample(texSampler, pos).rgb);
+	float value = mask.Sample(texSampler, pos).r;
+	return float4(brightness, value, brightness * value, brightness * brightness);
 }
 
-/* One tap of the joint bilateral upsample: the mask sample is weighted by how
- * close the image colour at the tap is to the colour at the pixel being shaded,
- * which pulls the low resolution mask edge onto the real edge in the image. */
-float2 refine_tap(float2 uv, float2 offset, float3 ref_color, float spatial)
+/* Pass 2, once per new mask at mask resolution: guided filter coefficients (He et al.).
+ * Within a small window the mask is modelled as a * brightness + b. Across a real edge in the
+ * picture `a` is large, so the upsampled mask follows that edge at full resolution; in flat areas
+ * `a` is 0 and the result is just the smooth local average of the mask. */
+float4 PSGuide(FragData f_in) : TARGET
 {
-	float2 pos = uv + offset;
-	float3 diff = image.Sample(texSampler, pos).rgb - ref_color;
-	float weight = spatial * exp(-dot(diff, diff) * range_scale);
-	return float2(mask_at(pos) * weight, weight);
+	float2 uv = f_in.uv;
+	float2 dx = float2(mask_texel.x * 1.5, 0.0);
+	float2 dy = float2(0.0, mask_texel.y * 1.5);
+
+	float4 stats = guide_stats(uv);
+	stats += guide_stats(uv + dx);
+	stats += guide_stats(uv - dx);
+	stats += guide_stats(uv + dy);
+	stats += guide_stats(uv - dy);
+	stats += guide_stats(uv + dx + dy);
+	stats += guide_stats(uv + dx - dy);
+	stats += guide_stats(uv - dx + dy);
+	stats += guide_stats(uv - dx - dy);
+	stats /= 9.0;
+
+	float variance = stats.w - stats.x * stats.x;
+	float covariance = stats.z - stats.x * stats.y;
+	float a = covariance / (variance + guide_eps);
+	float b = stats.y - a * stats.x;
+	return float4(a, b, stats.y, 1.0);
 }
 
+float4 coeff_at(float2 pos)
+{
+	return lerp(coeff.Sample(texSampler, pos), coeff_next.Sample(texSampler, pos), coeff_mix);
+}
+
+float image_brightness(float2 pos)
+{
+	float3 color = image.Sample(texSampler, pos).rgb;
+	return luma(lerp(color, to_nonlinear(color), image_linear));
+}
+
+/* Pass 3, every frame at full resolution: apply the coefficients to the shown frame and cut. */
 float4 PSMask(FragData f_in) : TARGET
 {
 	float2 uv = f_in.uv;
 	float4 rgba = image.Sample(texSampler, uv);
 
-	float2 dx = float2(tap_step.x, 0.0);
-	float2 dy = float2(0.0, tap_step.y);
+	/* Brightness averaged over a few pixels, so that sensor noise does not sparkle in the edge */
+	float2 px = image_texel * 1.5;
+	float brightness = image_brightness(uv) * 0.2;
+	brightness += image_brightness(uv + float2(px.x, 0.0)) * 0.125;
+	brightness += image_brightness(uv - float2(px.x, 0.0)) * 0.125;
+	brightness += image_brightness(uv + float2(0.0, px.y)) * 0.125;
+	brightness += image_brightness(uv - float2(0.0, px.y)) * 0.125;
+	brightness += image_brightness(uv + px) * 0.075;
+	brightness += image_brightness(uv - px) * 0.075;
+	brightness += image_brightness(uv + float2(px.x, -px.y)) * 0.075;
+	brightness += image_brightness(uv + float2(-px.x, px.y)) * 0.075;
 
-	float2 acc = float2(mask_at(uv), 1.0);
-	acc += refine_tap(uv, dx, rgba.rgb, 0.707);
-	acc += refine_tap(uv, -dx, rgba.rgb, 0.707);
-	acc += refine_tap(uv, dy, rgba.rgb, 0.707);
-	acc += refine_tap(uv, -dy, rgba.rgb, 0.707);
-	acc += refine_tap(uv, dx + dy, rgba.rgb, 0.5);
-	acc += refine_tap(uv, dx - dy, rgba.rgb, 0.5);
-	acc += refine_tap(uv, -dx + dy, rgba.rgb, 0.5);
-	acc += refine_tap(uv, -dx - dy, rgba.rgb, 0.5);
-	acc += refine_tap(uv, dx * 2.0, rgba.rgb, 0.25);
-	acc += refine_tap(uv, dx * -2.0, rgba.rgb, 0.25);
-	acc += refine_tap(uv, dy * 2.0, rgba.rgb, 0.25);
-	acc += refine_tap(uv, dy * -2.0, rgba.rgb, 0.25);
+	float2 dx = float2(mask_texel.x, 0.0);
+	float2 dy = float2(0.0, mask_texel.y);
+	float4 left = coeff_at(uv - dx);
+	float4 right = coeff_at(uv + dx);
+	float4 up = coeff_at(uv - dy);
+	float4 down = coeff_at(uv + dy);
+	float4 k = coeff_at(uv) * 0.4 + (left + right + up + down) * 0.15;
 
-	float alpha = smoothstep(edge_lo, edge_hi, acc.x / acc.y);
+	float soft = saturate(k.x * brightness + k.y);
+	float alpha = smoothstep(edge_lo, edge_hi, soft);
 
 	/* Defringe: partially transparent edge pixels still carry the colour of the
 	 * removed background. Replace it with colour from a little further inside
 	 * the subject, found by walking up the mask gradient. */
-	float2 grad = float2(mask_at(uv + dx) - mask_at(uv - dx), mask_at(uv + dy) - mask_at(uv - dy));
+	float2 grad = float2(right.z - left.z, down.z - up.z);
 	float grad_len = length(grad);
 	float2 inward = grad / max(grad_len, 0.0001);
 	float3 inner = image.Sample(texSampler, uv + inward * image_texel * defringe_px).rgb;
@@ -112,6 +197,15 @@ technique Stabilize
 	{
 		vertex_shader = VSDefault(v_in);
 		pixel_shader  = PSStabilize(f_in);
+	}
+}
+
+technique Guide
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSGuide(f_in);
 	}
 }
 
