@@ -25,3 +25,6 @@
 
 # Exclude CMake build number cache
 /cmake/.CMakeBuildNumber
+
+# Third party model files are added by the user, not shipped
+/data/models/

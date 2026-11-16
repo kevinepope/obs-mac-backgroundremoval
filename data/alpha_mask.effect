@@ -27,6 +27,22 @@ uniform float guide_eps;
 uniform float edge_lo;
 uniform float edge_hi;
 uniform float defringe_px;
+/* 1.0 when the mask is a true alpha matte and is used as it is rather than cut at a threshold */
+uniform float edge_linear;
+
+/* Background drawn behind the subject by the filter itself (Draw), both holding stored colour with
+ * a weight in alpha. `backdrop_soft` is a blurred copy and is where the light wrap takes its colour. */
+uniform texture2d backdrop;
+uniform texture2d backdrop_soft;
+uniform float backdrop_on;
+uniform float light_wrap;
+uniform float wrap_px;
+
+/* Backdrop and Blur passes */
+uniform float2 uv_scale;
+uniform float2 uv_offset;
+uniform float prepare_weighted;
+uniform float2 blur_step;
 
 sampler_state texSampler {
 	Filter    = Linear;
@@ -63,10 +79,17 @@ float3 to_nonlinear(float3 color)
 	return lerp(low, high, step(float3(0.0031308, 0.0031308, 0.0031308), color));
 }
 
-/* How much the picture changed at this point between the two frames the masks belong to */
-float picture_change(float2 pos)
+float3 to_linear(float3 color)
 {
-	return length(guide.Sample(texSampler, pos).rgb - guide_prev.Sample(texSampler, pos).rgb);
+	float3 low = color / 12.92;
+	float3 high = pow((max(color, float3(0.04045, 0.04045, 0.04045)) + 0.055) / 1.055, float3(2.4, 2.4, 2.4));
+	return lerp(low, high, step(float3(0.04045, 0.04045, 0.04045), color));
+}
+
+/* The difference at this point between the two frames the masks belong to */
+float3 picture_difference(float2 pos)
+{
+	return guide.Sample(texSampler, pos).rgb - guide_prev.Sample(texSampler, pos).rgb;
 }
 
 /* Pass 1, once per new mask at mask resolution: spatial and temporal stabilisation.
@@ -86,12 +109,14 @@ float4 PSStabilize(FragData f_in) : TARGET
 
 	float2 dx = float2(mask_texel.x * 1.5, 0.0);
 	float2 dy = float2(0.0, mask_texel.y * 1.5);
-	float change = picture_change(uv) * 0.5;
-	change += picture_change(uv + dx) * 0.125;
-	change += picture_change(uv - dx) * 0.125;
-	change += picture_change(uv + dy) * 0.125;
-	change += picture_change(uv - dy) * 0.125;
-	float still = 1.0 - smoothstep(0.04, 0.12, change);
+	/* Averaged before its size is taken: sensor noise differs from pixel to pixel and cancels
+	 * out, a real change in the picture does not. */
+	float3 difference = picture_difference(uv) * 0.2;
+	difference += picture_difference(uv + dx) * 0.2;
+	difference += picture_difference(uv - dx) * 0.2;
+	difference += picture_difference(uv + dy) * 0.2;
+	difference += picture_difference(uv - dy) * 0.2;
+	float still = 1.0 - smoothstep(0.04, 0.12, length(difference));
 
 	/* A change too small to be a real movement of the outline is held back completely, which
 	 * stops low level shimmer; larger changes are eased in. */
@@ -149,6 +174,13 @@ float image_brightness(float2 pos)
 	return luma(lerp(color, to_nonlinear(color), image_linear));
 }
 
+/* Colour of a background texture, in the same form as `image` is sampled in */
+float3 backdrop_color(float4 stored)
+{
+	float3 color = stored.rgb / max(stored.a, 0.0001);
+	return lerp(color, to_linear(color), image_linear);
+}
+
 /* Pass 3, every frame at full resolution: apply the coefficients to the shown frame and cut. */
 float4 PSMask(FragData f_in) : TARGET
 {
@@ -176,7 +208,8 @@ float4 PSMask(FragData f_in) : TARGET
 	float4 k = coeff_at(uv) * 0.4 + (left + right + up + down) * 0.15;
 
 	float soft = saturate(k.x * brightness + k.y);
-	float alpha = smoothstep(edge_lo, edge_hi, soft);
+	float ramp = saturate((soft - edge_lo) / (edge_hi - edge_lo));
+	float alpha = lerp(ramp * ramp * (3.0 - 2.0 * ramp), ramp, edge_linear);
 
 	/* Defringe: partially transparent edge pixels still carry the colour of the
 	 * removed background. Replace it with colour from a little further inside
@@ -188,7 +221,50 @@ float4 PSMask(FragData f_in) : TARGET
 	float pull = (1.0 - alpha) * step(0.01, grad_len) * step(0.001, defringe_px);
 	rgba.rgb = lerp(rgba.rgb, inner, pull);
 
-	return rgba * alpha;
+	if (backdrop_on < 0.5)
+		return rgba * alpha;
+
+	/* The filter draws the background itself, which allows what a separate layer cannot: letting
+	 * the background's light spill a little over the rim of the subject (light wrap). That is
+	 * what makes a cut-out sit in its background, and it hides what is left of the old one. */
+	float3 behind = backdrop_color(backdrop.Sample(texSampler, uv));
+	float3 spill = backdrop_color(backdrop_soft.Sample(texSampler, uv));
+	float2 reach = image_texel * wrap_px;
+	float inside = k.z * 0.2;
+	inside += coeff_at(uv + reach).z * 0.2;
+	inside += coeff_at(uv - reach).z * 0.2;
+	inside += coeff_at(uv + float2(reach.x, -reach.y)).z * 0.2;
+	inside += coeff_at(uv + float2(-reach.x, reach.y)).z * 0.2;
+	float rim = 1.0 - smoothstep(0.55, 1.0, inside);
+	float3 subject = lerp(rgba.rgb, spill, rim * light_wrap);
+	return float4(lerp(behind, subject, alpha), 1.0);
+}
+
+/* Background pass 1, at a quarter of the size: the picture to blur, weighted so that the subject
+ * is left out. Without the weight the blur would smear the subject into a glow around itself. */
+float4 PSBackdrop(FragData f_in) : TARGET
+{
+	float2 pos = f_in.uv * uv_scale + uv_offset;
+	float3 color = image.Sample(texSampler, pos + image_texel).rgb;
+	color += image.Sample(texSampler, pos - image_texel).rgb;
+	color += image.Sample(texSampler, pos + float2(image_texel.x, -image_texel.y)).rgb;
+	color += image.Sample(texSampler, pos + float2(-image_texel.x, image_texel.y)).rgb;
+	color *= 0.25;
+	float background = max(1.0 - smoothstep(0.05, 0.5, coeff_at(f_in.uv).z), 0.002);
+	float weight = lerp(1.0, background, prepare_weighted);
+	return float4(color * weight, weight);
+}
+
+/* Background pass 2, run across and then down, a few times with a growing step */
+float4 PSBlur(FragData f_in) : TARGET
+{
+	float2 uv = f_in.uv;
+	float4 sum = image.Sample(texSampler, uv) * 0.2042;
+	sum += (image.Sample(texSampler, uv + blur_step) + image.Sample(texSampler, uv - blur_step)) * 0.1802;
+	sum += (image.Sample(texSampler, uv + blur_step * 2.0) + image.Sample(texSampler, uv - blur_step * 2.0)) * 0.1238;
+	sum += (image.Sample(texSampler, uv + blur_step * 3.0) + image.Sample(texSampler, uv - blur_step * 3.0)) * 0.0663;
+	sum += (image.Sample(texSampler, uv + blur_step * 4.0) + image.Sample(texSampler, uv - blur_step * 4.0)) * 0.0276;
+	return sum;
 }
 
 technique Stabilize
@@ -215,5 +291,23 @@ technique Draw
 	{
 		vertex_shader = VSDefault(v_in);
 		pixel_shader  = PSMask(f_in);
+	}
+}
+
+technique Backdrop
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBackdrop(f_in);
+	}
+}
+
+technique Blur
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBlur(f_in);
 	}
 }
