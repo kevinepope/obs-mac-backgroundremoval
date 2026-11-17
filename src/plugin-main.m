@@ -1102,8 +1102,8 @@ static void vision_render(void *filter_ptr, gs_effect_t *)
     gs_effect_set_float(filter->edge_hi_param, edge_hi);
     gs_effect_set_float(filter->defringe_px_param, filter->defringe * 6.0f);
     gs_effect_set_float(filter->edge_linear_param, matte ? 1.0f : 0.0f);
-    gs_effect_set_texture(filter->backdrop_param, composite ? backdrop : frame);
-    gs_effect_set_texture(filter->backdrop_soft_param, composite ? backdrop_soft : frame);
+    gs_effect_set_texture(filter->backdrop_param, composite ? backdrop : coeff);
+    gs_effect_set_texture(filter->backdrop_soft_param, composite ? backdrop_soft : coeff);
     gs_effect_set_float(filter->backdrop_on_param, composite ? 1.0f : 0.0f);
     gs_effect_set_float(filter->light_wrap_param, filter->light_wrap * 0.8f);
     gs_effect_set_float(filter->wrap_px_param, (float) height / 90.0f);
